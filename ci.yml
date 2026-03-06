@@ -1,0 +1,267 @@
+# ╔══════════════════════════════════════════════════════════╗
+# ║          GitHub Actions — CI/CD Pipeline                ║
+# ║  Save as: .github/workflows/ci.yml                      ║
+# ╚══════════════════════════════════════════════════════════╝
+#
+# Triggers: push to main/develop + all pull requests
+# Stages:   Lint → Test → Security Scan → Build → Notify
+#
+# Required secrets (Settings → Secrets → Actions):
+#   SNYK_TOKEN      — https://app.snyk.io/account
+#   SLACK_WEBHOOK   — optional, for notifications
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, "release/**"]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel in-progress runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────
+env:
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+
+# ─────────────────────────────────────────────
+jobs:
+
+  # ── 1. Lint & Format ────────────────────────
+  lint:
+    name: "🔍 Lint & Format"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect project type
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then echo "type=node" >> $GITHUB_OUTPUT
+          elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then echo "type=python" >> $GITHUB_OUTPUT
+          else echo "type=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      # Node
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.type == 'node'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+      - name: Install Node deps
+        if: steps.detect.outputs.type == 'node'
+        run: npm ci
+      - name: ESLint
+        if: steps.detect.outputs.type == 'node'
+        run: npm run lint
+      - name: Prettier check
+        if: steps.detect.outputs.type == 'node'
+        run: npx prettier --check "**/*.{js,ts,jsx,tsx,json,css,md}" || true
+
+      # Python
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.type == 'python'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install ruff
+        if: steps.detect.outputs.type == 'python'
+        run: pip install ruff
+      - name: Ruff lint
+        if: steps.detect.outputs.type == 'python'
+        run: ruff check .
+      - name: Ruff format check
+        if: steps.detect.outputs.type == 'python'
+        run: ruff format --check .
+
+  # ── 2. Unit Tests ────────────────────────────
+  test:
+    name: "🧪 Unit Tests"
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        # test on multiple OS for cross-platform projects
+        os: [ubuntu-latest]
+        # os: [ubuntu-latest, windows-latest, macos-latest]  # uncomment if needed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect project type
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then echo "type=node" >> $GITHUB_OUTPUT
+          elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then echo "type=python" >> $GITHUB_OUTPUT
+          else echo "type=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      # Node tests
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.type == 'node'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+      - run: npm ci
+        if: steps.detect.outputs.type == 'node'
+      - name: Run tests with coverage
+        if: steps.detect.outputs.type == 'node'
+        run: npm test -- --coverage --watchAll=false
+      - name: Upload coverage
+        if: steps.detect.outputs.type == 'node'
+        uses: codecov/codecov-action@v4
+        with:
+          fail_ci_if_error: false
+
+      # Python tests
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.type == 'python'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        if: steps.detect.outputs.type == 'python'
+        run: |
+          pip install -r requirements.txt 2>/dev/null || true
+          pip install pytest pytest-cov
+      - name: Run pytest with coverage
+        if: steps.detect.outputs.type == 'python'
+        run: pytest --cov=. --cov-report=xml -q
+      - name: Upload coverage
+        if: steps.detect.outputs.type == 'python'
+        uses: codecov/codecov-action@v4
+        with:
+          fail_ci_if_error: false
+
+  # ── 3. Security Scanning ─────────────────────
+  security:
+    name: "🔒 Security Scan"
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      security-events: write   # for SARIF upload
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history for secret scanning
+
+      # Detect secrets in git history
+      - name: TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+      # Dependency vulnerability scan (optional, needs SNYK_TOKEN secret)
+      - name: Snyk dependency scan
+        if: ${{ secrets.SNYK_TOKEN != '' }}
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+        continue-on-error: true   # don't block on medium vulns
+
+      # CodeQL static analysis (GitHub-native, no token needed)
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, python
+        continue-on-error: true
+
+      - name: Autobuild for CodeQL
+        uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        continue-on-error: true
+
+  # ── 4. Build ─────────────────────────────────
+  build:
+    name: "🏗️ Build"
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect project type
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then echo "type=node" >> $GITHUB_OUTPUT
+          elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then echo "type=python" >> $GITHUB_OUTPUT
+          else echo "type=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.type == 'node'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+      - run: npm ci && npm run build
+        if: steps.detect.outputs.type == 'node'
+
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.type == 'python'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build Python package
+        if: steps.detect.outputs.type == 'python'
+        run: |
+          pip install build
+          python -m build --wheel --no-isolation
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            dist/
+            build/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── 5. Deploy (main branch only) ─────────────
+  deploy:
+    name: "🚀 Deploy"
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+
+      - name: Deploy (customize this step)
+        run: |
+          echo "→ Add your deployment commands here"
+          echo "→ e.g.: vercel --prod, eb deploy, kubectl apply, etc."
+        # Example for Vercel:
+        # uses: amondnet/vercel-action@v25
+        # with:
+        #   vercel-token: ${{ secrets.VERCEL_TOKEN }}
+        #   vercel-org-id: ${{ secrets.ORG_ID }}
+        #   vercel-project-id: ${{ secrets.PROJECT_ID }}
+        #   vercel-args: '--prod'
+
+  # ── 6. Notify on failure ─────────────────────
+  notify:
+    name: "📣 Notify"
+    runs-on: ubuntu-latest
+    needs: [lint, test, security, build]
+    if: failure() && secrets.SLACK_WEBHOOK != ''
+    steps:
+      - name: Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""
+╔═══════════════════════════════════════════════════════════╗
+║              AI-COMMIT — Smart Git Workflow               ║
+║   Quality Checks → AI Commit → Security → Push           ║
+╚═══════════════════════════════════════════════════════════╝
+
+Cross-platform (Linux / macOS / Windows via Git Bash / WSL)
+Multi-provider: OpenAI · Anthropic · Ollama · any OpenAI-compat API
+Config loaded from: .env (project) → ~/.ai-commit/.env (global)
+"""
+
+import os
+import sys
+import json
+import subprocess
+import re
+import argparse
+import platform
+from pathlib import Path
+
+# ── Force UTF-8 everywhere on Windows ──────────────────────
+# Must happen before any subprocess or print call
+if platform.system() == "Windows" or os.environ.get("MSYSTEM"):
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    os.environ["PYTHONUTF8"] = "1"
+    # Git: force diff output in UTF-8
+    os.environ.setdefault("GIT_TERMINAL_PROMPT", "0")
+    os.environ["LC_ALL"] = "C.UTF-8"
+    try:
+        # Reconfigure stdout/stderr to UTF-8 (Python 3.7+)
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
+# ─────────────────────────────────────────────
+# 0. COLOUR HELPERS  (work on all platforms)
+# ─────────────────────────────────────────────
+if platform.system() == "Windows" and "WT_SESSION" not in os.environ:
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleMode(
+            ctypes.windll.kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
+class C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    RED    = "\033[91m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE   = "\033[94m"
+    CYAN   = "\033[96m"
+    WHITE  = "\033[97m"
+    DIM    = "\033[2m"
+
+def _p(color: str, icon: str, msg: str):
+    print(f"{color}{C.BOLD}{icon}{C.RESET} {color}{msg}{C.RESET}")
+
+def ok(msg):    _p(C.GREEN,  "✔", msg)
+def err(msg):   _p(C.RED,    "✘", msg)
+def warn(msg):  _p(C.YELLOW, "⚠", msg)
+def info(msg):  _p(C.CYAN,   "→", msg)
+def head(msg):  print(f"\n{C.BLUE}{C.BOLD}{'─'*55}\n  {msg}\n{'─'*55}{C.RESET}")
+
+def die(msg: str, code: int = 1):
+    err(msg)
+    sys.exit(code)
+
+# ─────────────────────────────────────────────
+# 1. ENV LOADER  (.env cascade)
+# ─────────────────────────────────────────────
+def load_env():
+    """Load .env files: project-local wins over global ~/.ai-commit/.env"""
+    candidates = [
+        Path.home() / ".ai-commit" / ".env",   # global defaults
+        Path.cwd() / ".env",                    # project override
+    ]
+    # Only ASCII uppercase letters, digits and underscore are valid env var names
+    valid_key = re.compile(r'^[A-Z][A-Z0-9_]*$')
+
+    for env_file in candidates:
+        if not env_file.exists():
+            continue
+        try:
+            raw = env_file.read_text(encoding="utf-8-sig", errors="replace")
+        except Exception:
+            continue
+        for line in raw.splitlines():
+            # Strip BOM, whitespace, and any unicode decoration characters
+            line = line.strip().lstrip('\ufeff')
+            # Skip blank lines and comments
+            if not line or line.startswith('#'):
+                continue
+            # Must contain = to be a key=value pair
+            if '=' not in line:
+                continue
+            key, _, val = line.partition('=')
+            key = key.strip()
+            # Strip inline comments from value (e.g. key=value # comment)
+            val = val.split('#')[0].strip().strip('"').strip("'")
+            # Validate key: must be a proper env var name
+            if not valid_key.match(key):
+                continue
+            # Don't overwrite already-set env vars (shell wins)
+            if key not in os.environ:
+                os.environ[key] = val
+
+def cfg(key: str, default=None):
+    return os.environ.get(key, default)
+
+# ─────────────────────────────────────────────
+# 2. SHELL RUNNER
+# ─────────────────────────────────────────────
+def run(cmd, capture=False, check=True, shell=False):
+    """Run a command; return CompletedProcess. Always UTF-8 safe."""
+    if isinstance(cmd, str) and not shell:
+        cmd = cmd.split()
+    kwargs = dict(
+        capture_output=capture,
+        text=True,
+        encoding="utf-8",
+        errors="replace",      # never crash on unknown bytes
+        shell=shell,
+        env=os.environ,
+    )
+    result = subprocess.run(cmd, **kwargs)
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd,
+                                            result.stdout, result.stderr)
+    return result
+
+def run_ok(cmd, shell=False) -> bool:
+    """Return True if command exits 0."""
+    try:
+        run(cmd, check=True, shell=shell)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+def cmd_exists(name: str) -> bool:
+    import shutil
+    return shutil.which(name) is not None
+
+# ─────────────────────────────────────────────
+# 3. PHASE 1 — QUALITY VALIDATION
+# ─────────────────────────────────────────────
+def phase_quality():
+    head("PHASE 1 · Quality Validation (Tests & Linting)")
+
+    skip = cfg("AI_COMMIT_SKIP_QUALITY", "false").lower() == "true"
+    if skip:
+        warn("AI_COMMIT_SKIP_QUALITY=true — skipping quality phase")
+        return
+
+    # ── detect project type ──────────────────
+    cwd = Path.cwd()
+    errors = []
+
+    # Node / JS / TS
+    if (cwd / "package.json").exists():
+        pkg = json.loads((cwd / "package.json").read_text())
+        scripts = pkg.get("scripts", {})
+
+        # linting
+        linter_cmd = cfg("AI_COMMIT_LINT_CMD")
+        if linter_cmd:
+            info(f"Running linter: {linter_cmd}")
+        elif "lint" in scripts:
+            linter_cmd = "npm run lint"
+            info("Running: npm run lint")
+        elif cmd_exists("eslint"):
+            linter_cmd = "eslint ."
+            info("Running: eslint .")
+        else:
+            warn("No linter found — set AI_COMMIT_LINT_CMD in .env to override")
+
+        if linter_cmd:
+            try:
+                run(linter_cmd, shell=True)
+                ok("Linter passed")
+            except subprocess.CalledProcessError:
+                errors.append("Linter failed. Fix errors before committing.")
+
+        # tests
+        test_cmd = cfg("AI_COMMIT_TEST_CMD")
+        if test_cmd:
+            info(f"Running tests: {test_cmd}")
+        elif "test" in scripts:
+            test_cmd = "npm test -- --watchAll=false"
+            info("Running: npm test")
+        elif cmd_exists("jest"):
+            test_cmd = "jest --passWithNoTests"
+
+        if test_cmd:
+            try:
+                run(test_cmd, shell=True)
+                ok("Tests passed")
+            except subprocess.CalledProcessError:
+                errors.append("Unit tests FAILED. Fix before committing.")
+
+    # Python
+    elif (cwd / "pyproject.toml").exists() or (cwd / "setup.py").exists() \
+            or list(cwd.glob("*.py")):
+        linter_cmd = cfg("AI_COMMIT_LINT_CMD")
+        test_cmd   = cfg("AI_COMMIT_TEST_CMD")
+
+        if not linter_cmd:
+            if cmd_exists("ruff"):   linter_cmd = "ruff check ."
+            elif cmd_exists("flake8"): linter_cmd = "flake8 ."
+        if not test_cmd:
+            if cmd_exists("pytest"): test_cmd = "pytest --tb=short -q"
+
+        for label, cmd_ in [("Linter", linter_cmd), ("Tests", test_cmd)]:
+            if cmd_:
+                info(f"Running {label}: {cmd_}")
+                try:
+                    run(cmd_, shell=True)
+                    ok(f"{label} passed")
+                except subprocess.CalledProcessError:
+                    errors.append(f"{label} FAILED.")
+            else:
+                warn(f"No {label.lower()} detected — set AI_COMMIT_LINT_CMD / AI_COMMIT_TEST_CMD")
+
+    else:
+        # generic fallback
+        custom_test = cfg("AI_COMMIT_TEST_CMD")
+        custom_lint = cfg("AI_COMMIT_LINT_CMD")
+        if custom_test:
+            try:
+                run(custom_test, shell=True)
+                ok("Custom test command passed")
+            except subprocess.CalledProcessError:
+                errors.append("Custom test command FAILED.")
+        if custom_lint:
+            try:
+                run(custom_lint, shell=True)
+                ok("Custom lint command passed")
+            except subprocess.CalledProcessError:
+                errors.append("Custom lint command FAILED.")
+        if not custom_test and not custom_lint:
+            warn("No test/lint detected. Set AI_COMMIT_TEST_CMD / AI_COMMIT_LINT_CMD")
+
+    if errors:
+        for e in errors:
+            err(e)
+        die("Quality phase FAILED — commit aborted.", 2)
+
+    ok("All quality checks passed ✓")
+
+# ─────────────────────────────────────────────
+# 4. PHASE 2 — AI COMMIT GENERATION
+# ─────────────────────────────────────────────
+def get_staged_diff() -> str:
+    try:
+        # -c core.quotepath=false → don't escape non-ASCII filenames
+        result = run(
+            ["git", "-c", "core.quotepath=false",
+             "-c", "i18n.logOutputEncoding=UTF-8",
+             "diff", "--cached"],
+            capture=True
+        )
+        return (result.stdout or "").strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+def get_staged_files() -> list[str]:
+    try:
+        result = run(
+            ["git", "-c", "core.quotepath=false",
+             "diff", "--cached", "--name-only"],
+            capture=True
+        )
+        return [f for f in (result.stdout or "").strip().splitlines() if f]
+    except subprocess.CalledProcessError:
+        return []
+
+# ── provider implementations ─────────────────
+
+def _call_openai_compat(base_url: str, api_key: str, model: str,
+                         system: str, prompt: str) -> str:
+    """Generic OpenAI-compatible /v1/chat/completions call (no SDK needed)."""
+    import urllib.request, urllib.error
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 400,
+    }).encode()
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def _call_anthropic(api_key: str, model: str, system: str, prompt: str) -> str:
+    import urllib.request
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 400,
+        "system": system,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    return data["content"][0]["text"].strip()
+
+
+def _call_ollama(base_url: str, model: str, system: str, prompt: str) -> str:
+    import urllib.request
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ],
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+    return data["message"]["content"].strip()
+
+
+def call_ai(diff: str, files: list[str]) -> str:
+    """Route to the correct provider based on AI_COMMIT_PROVIDER env var."""
+    provider  = cfg("AI_COMMIT_PROVIDER", "openai").lower()
+    max_chars = int(cfg("AI_COMMIT_DIFF_MAX_CHARS", "8000"))
+    diff_snip = diff[:max_chars] + ("\n…[truncated]" if len(diff) > max_chars else "")
+
+    SYSTEM = (
+        "You are an expert software engineer. "
+        "Given a git diff you MUST return ONLY a single Conventional Commit message "
+        "with this exact format:\n\n"
+        "<type>(<scope>): <short description>\n\n"
+        "<body — 2-4 sentences explaining WHY, not WHAT>\n\n"
+        "Rules:\n"
+        "- type: feat|fix|docs|style|refactor|perf|test|chore|ci|build\n"
+        "- scope: the module/file most affected (lowercase, no spaces)\n"
+        "- short description: imperative mood, ≤72 chars, no period\n"
+        "- body: optional but preferred\n"
+        "- NO markdown, NO fences, NO extra commentary."
+    )
+    PROMPT = (
+        f"Files changed: {', '.join(files) if files else 'unknown'}\n\n"
+        f"Git diff:\n{diff_snip}"
+    )
+
+    info(f"AI provider: {provider}")
+
+    try:
+        if provider == "anthropic":
+            api_key = cfg("ANTHROPIC_API_KEY") or die("ANTHROPIC_API_KEY not set")
+            model   = cfg("AI_COMMIT_MODEL", "claude-3-5-haiku-20241022")
+            return _call_anthropic(api_key, model, SYSTEM, PROMPT)
+
+        elif provider == "ollama":
+            base_url = cfg("OLLAMA_BASE_URL", "http://localhost:11434")
+            model    = cfg("AI_COMMIT_MODEL", "llama3")
+            return _call_ollama(base_url, model, SYSTEM, PROMPT)
+
+        elif provider == "custom":
+            base_url = cfg("AI_COMMIT_BASE_URL") or die("AI_COMMIT_BASE_URL not set")
+            api_key  = cfg("AI_COMMIT_API_KEY", "nokey")
+            model    = cfg("AI_COMMIT_MODEL", "gpt-4o-mini")
+            return _call_openai_compat(base_url, api_key, model, SYSTEM, PROMPT)
+
+        else:  # openai (default)
+            api_key = cfg("OPENAI_API_KEY") or die("OPENAI_API_KEY not set")
+            model   = cfg("AI_COMMIT_MODEL", "gpt-4o-mini")
+            base_url = cfg("AI_COMMIT_BASE_URL", "https://api.openai.com")
+            return _call_openai_compat(base_url, api_key, model, SYSTEM, PROMPT)
+
+    except Exception as exc:
+        die(f"AI call failed ({provider}): {exc}")
+
+
+def phase_ai_commit() -> str:
+    head("PHASE 2 · AI Commit Message Generation")
+
+    diff  = get_staged_diff()
+    files = get_staged_files()
+
+    if not diff:
+        die("Nothing staged. Run `git add <files>` first.", 3)
+
+    info(f"Staged files: {', '.join(files)}")
+    info("Sending diff to AI — please wait…")
+
+    message = call_ai(diff, files)
+
+    # basic sanity: must look like a conventional commit
+    if not re.match(r"^\w+(\(.+\))?!?: .+", message):
+        warn("AI response doesn't look like a Conventional Commit; using as-is.")
+
+    print(f"\n{C.GREEN}{C.BOLD}Generated commit message:{C.RESET}")
+    print(f"{C.WHITE}{'─'*55}")
+    print(message)
+    print(f"{'─'*55}{C.RESET}\n")
+
+    # interactive confirmation
+    if cfg("AI_COMMIT_NO_CONFIRM", "false").lower() != "true":
+        answer = input(f"{C.YELLOW}Accept this message? [Y/n/e(dit)]: {C.RESET}").strip().lower()
+        if answer == "n":
+            die("Commit aborted by user.", 0)
+        if answer == "e":
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
+                                             delete=False) as tf:
+                tf.write(message)
+                tf_name = tf.name
+            editor = cfg("EDITOR", "vi" if not platform.system() == "Windows" else "notepad")
+            os.system(f'{editor} "{tf_name}"')
+            message = Path(tf_name).read_text().strip()
+            os.unlink(tf_name)
+            ok("Commit message updated.")
+
+    return message
+
+# ─────────────────────────────────────────────
+# 5. PHASE 3 — SECURITY & BUILD CHECK
+# ─────────────────────────────────────────────
+
+# Patterns that suggest leaked secrets
+SECRET_PATTERNS = [
+    (r'(?i)(api[_-]?key|apikey)\s*[:=]\s*["\']?[A-Za-z0-9_\-]{16,}',
+     "Possible API key"),
+    (r'(?i)(secret|password|passwd|pwd)\s*[:=]\s*["\']?\S{8,}',
+     "Possible password/secret"),
+    (r'(?i)aws[_-]?(access[_-]?key[_-]?id|secret[_-]?access[_-]?key)\s*[:=]\s*\S+',
+     "AWS credential"),
+    (r'(?i)(sk|pk)-(live|test)-[A-Za-z0-9]{24,}',
+     "Stripe key"),
+    (r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+     "JWT token"),
+    (r'-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----',
+     "Private key"),
+    (r'ghp_[A-Za-z0-9]{36}',
+     "GitHub Personal Access Token"),
+    (r'xox[baprs]-[A-Za-z0-9\-]+',
+     "Slack token"),
+]
+
+def scan_secrets(files: list[str]) -> list[str]:
+    issues = []
+    for fpath in files:
+        p = Path(fpath)
+        if not p.exists() or p.stat().st_size > 500_000:
+            continue
+        try:
+            content = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for pattern, label in SECRET_PATTERNS:
+            if re.search(pattern, content):
+                issues.append(f"{label} detected in {fpath}")
+    return issues
+
+
+def phase_production_ready():
+    head("PHASE 3 · Production-Ready Check (Security + Build)")
+
+    skip = cfg("AI_COMMIT_SKIP_SECURITY", "false").lower() == "true"
+    if skip:
+        warn("AI_COMMIT_SKIP_SECURITY=true — skipping security scan")
+    else:
+        files = get_staged_files()
+        info(f"Scanning {len(files)} file(s) for exposed secrets…")
+        issues = scan_secrets(files)
+
+        # also run gitleaks / trufflehog if available
+        if cmd_exists("gitleaks"):
+            info("Running gitleaks (installed) …")
+            if not run_ok(["gitleaks", "protect", "--staged", "-v"]):
+                issues.append("gitleaks found potential secrets — review before committing")
+        elif cmd_exists("trufflehog"):
+            info("Running trufflehog …")
+            if not run_ok(["trufflehog", "git", "file://.", "--only-verified", "--no-update"],
+                          shell=False):
+                issues.append("trufflehog found verified secrets")
+
+        if issues:
+            for i in issues:
+                err(i)
+            if cfg("AI_COMMIT_STRICT_SECURITY", "true").lower() == "true":
+                die("Security check FAILED — commit aborted. Set "
+                    "AI_COMMIT_STRICT_SECURITY=false to downgrade to warning.", 4)
+            else:
+                warn("Security issues found but AI_COMMIT_STRICT_SECURITY=false — continuing")
+        else:
+            ok("No secrets detected ✓")
+
+    # build
+    build_cmd = cfg("AI_COMMIT_BUILD_CMD")
+    skip_build = cfg("AI_COMMIT_SKIP_BUILD", "false").lower() == "true"
+
+    if skip_build:
+        warn("AI_COMMIT_SKIP_BUILD=true — skipping build")
+        return
+
+    cwd = Path.cwd()
+    if not build_cmd:
+        if (cwd / "package.json").exists():
+            pkg = json.loads((cwd / "package.json").read_text())
+            if "build" in pkg.get("scripts", {}):
+                build_cmd = "npm run build"
+        elif (cwd / "Makefile").exists():
+            build_cmd = "make build"
+        elif (cwd / "pyproject.toml").exists() and cmd_exists("python"):
+            build_cmd = "python -m build --wheel --no-isolation"
+
+    if build_cmd:
+        info(f"Running build: {build_cmd}")
+        try:
+            run(build_cmd, shell=True)
+            ok("Build succeeded ✓")
+        except subprocess.CalledProcessError:
+            die("Build FAILED — fix errors before pushing.", 5)
+    else:
+        warn("No build command detected. Set AI_COMMIT_BUILD_CMD in .env to add one.")
+
+# ─────────────────────────────────────────────
+# 6. PHASE 4 — GIT COMMIT & PUSH
+# ─────────────────────────────────────────────
+def get_current_branch() -> str:
+    try:
+        result = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture=True)
+        return (result.stdout or "main").strip()
+    except subprocess.CalledProcessError:
+        return "main"
+
+
+def phase_git(commit_message: str, args):
+    head("PHASE 4 · Git Commit & Push")
+
+    branch = get_current_branch()
+    push_target = cfg("AI_COMMIT_PUSH_REMOTE", "origin")
+
+    # commit
+    info(f"Creating commit on branch '{branch}' …")
+    try:
+        run(["git", "commit", "-m", commit_message])
+        ok("Commit created ✓")
+    except subprocess.CalledProcessError as exc:
+        die(f"git commit failed: {exc.stderr}", 6)
+
+    # push
+    if args.no_push or cfg("AI_COMMIT_NO_PUSH", "false").lower() == "true":
+        warn("Push skipped (--no-push or AI_COMMIT_NO_PUSH=true)")
+        return
+
+    info(f"Pushing to {push_target}/{branch} …")
+    push_flags = cfg("AI_COMMIT_PUSH_FLAGS", "").split()
+    cmd_ = ["git", "push", push_target, branch] + push_flags
+    try:
+        run(cmd_)
+        ok(f"Pushed to {push_target}/{branch} ✓")
+    except subprocess.CalledProcessError as exc:
+        die(f"git push failed: {exc.stderr}", 7)
+
+# ─────────────────────────────────────────────
+# 7. ENTRY POINT
+# ─────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="ai-commit",
+        description="AI-powered Git workflow: quality → AI commit → security → push",
+    )
+    p.add_argument("--no-push",      action="store_true",
+                   help="Skip git push after commit")
+    p.add_argument("--no-quality",   action="store_true",
+                   help="Skip tests/linting phase")
+    p.add_argument("--no-security",  action="store_true",
+                   help="Skip security scan")
+    p.add_argument("--no-build",     action="store_true",
+                   help="Skip build check")
+    p.add_argument("--dry-run",      action="store_true",
+                   help="Run all phases but skip git commit/push")
+    p.add_argument("--provider",
+                   help="Override AI_COMMIT_PROVIDER (openai|anthropic|ollama|custom)")
+    return p.parse_args()
+
+
+def main():
+    load_env()
+    args = parse_args()
+
+    # CLI overrides
+    if args.no_quality:  os.environ["AI_COMMIT_SKIP_QUALITY"]  = "true"
+    if args.no_security: os.environ["AI_COMMIT_SKIP_SECURITY"] = "true"
+    if args.no_build:    os.environ["AI_COMMIT_SKIP_BUILD"]    = "true"
+    if args.provider:    os.environ["AI_COMMIT_PROVIDER"]      = args.provider
+
+    print(f"\n{C.CYAN}{C.BOLD}"
+          f"╔══════════════════════════════════════╗\n"
+          f"║        AI-COMMIT  v1.0               ║\n"
+          f"║  Quality · AI · Security · Push      ║\n"
+          f"╚══════════════════════════════════════╝{C.RESET}\n")
+
+    # verify we're inside a git repo
+    if not run_ok(["git", "rev-parse", "--is-inside-work-tree"], shell=False):
+        die("Not inside a git repository.", 1)
+
+    phase_quality()
+    commit_msg = phase_ai_commit()
+    phase_production_ready()
+
+    if args.dry_run:
+        warn("--dry-run: skipping git commit and push")
+        print(f"\n{C.GREEN}{C.BOLD}✔ Dry-run complete. Commit message ready:{C.RESET}")
+        print(commit_msg)
+        return
+
+    phase_git(commit_msg, args)
+
+    print(f"\n{C.GREEN}{C.BOLD}{'═'*45}")
+    print("  🚀  All phases passed — code shipped!")
+    print(f"{'═'*45}{C.RESET}\n")
+
+
+if __name__ == "__main__":
+    main()
