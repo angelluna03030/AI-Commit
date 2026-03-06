@@ -397,7 +397,7 @@ Found a bug? Please [open an issue](https://github.com/angelluna03030/ai-commit-
 
 ## 📄 License
 
-Distributed under the **MIT License**. See [`LICENSE`](./LICENSE) for full details.
+Distributed under the **MIT License**. See [`LICENSE`](./[LICENSE](https://github.com/angelluna03030/AI-Commit/blob/main/LICENSE.txt)) for full details.
 
 ```
 MIT License — Copyright (c) 2025 Angel Stiven Garcia Luna
