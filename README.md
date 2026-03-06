@@ -132,9 +132,9 @@ nano ~/.ai-commit/.env
 | Variable | Required | Example | Description |
 |---|---|---|---|
 | `AI_COMMIT_PROVIDER` | ✅ | `custom` | AI backend: `openai` · `anthropic` · `ollama` · `custom` |
-| `OPENAI_API_KEY` | ⚠️ | `sk-proj-...` | Required only when provider is `openai` |
-| `ANTHROPIC_API_KEY` | ⚠️ | `sk-ant-...` | Required only when provider is `anthropic` |
-| `AI_COMMIT_API_KEY` | ⚠️ | `sk-74e1...` | Required when provider is `custom` (DeepSeek, Groq, etc.) |
+| `OPENAI_API_KEY` | ⚠️ | `API_KEY-...` | Required only when provider is `openai` |
+| `ANTHROPIC_API_KEY` | ⚠️ | `API_KEY-...` | Required only when provider is `anthropic` |
+| `AI_COMMIT_API_KEY` | ⚠️ | `API_KEY...` | Required when provider is `custom` (DeepSeek, Groq, etc.) |
 | `AI_COMMIT_BASE_URL` | ⚠️ | `https://api.deepseek.com` | Base URL for `custom` provider |
 | `AI_COMMIT_MODEL` | ✅ | `deepseek-chat` | Model name to use for generation |
 | `AI_COMMIT_DIFF_MAX_CHARS` | ❌ | `8000` | Max diff characters sent to AI (controls cost) |
@@ -172,7 +172,7 @@ nano ~/.ai-commit/.env
 
 ```env
 AI_COMMIT_PROVIDER=openai
-OPENAI_API_KEY=sk-proj-your-key-here
+OPENAI_API_KEY=API_KEY
 AI_COMMIT_MODEL=gpt-4o-mini
 ```
 </details>
@@ -182,7 +182,7 @@ AI_COMMIT_MODEL=gpt-4o-mini
 
 ```env
 AI_COMMIT_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-your-key-here
+ANTHROPIC_API_KEY=API_KEY
 AI_COMMIT_MODEL=claude-3-5-haiku-20241022
 ```
 </details>
@@ -193,7 +193,7 @@ AI_COMMIT_MODEL=claude-3-5-haiku-20241022
 ```env
 AI_COMMIT_PROVIDER=custom
 AI_COMMIT_BASE_URL=https://api.deepseek.com
-AI_COMMIT_API_KEY=sk-your-deepseek-key
+AI_COMMIT_API_KEY=API_KEY
 AI_COMMIT_MODEL=deepseek-chat
 ```
 </details>
