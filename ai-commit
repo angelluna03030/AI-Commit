@@ -2,7 +2,7 @@
 """
 ╔═══════════════════════════════════════════════════════════╗
 ║              AI-COMMIT — Smart Git Workflow               ║
-║   Quality Checks → AI Commit → Security → Push           ║
+║   Quality Checks → AI Commit → Security → Push            ║
 ╚═══════════════════════════════════════════════════════════╝
 
 Cross-platform (Linux / macOS / Windows via Git Bash / WSL)
@@ -481,69 +481,65 @@ def scan_secrets(files: list[str]) -> list[str]:
                 issues.append(f"{label} detected in {fpath}")
     return issues
 
-
 def phase_production_ready():
-    head("PHASE 3 · Production-Ready Check (Security + Build)")
+    head("PHASE 3 · Production-Ready Check (Security & Build)")
 
-    skip = cfg("AI_COMMIT_SKIP_SECURITY", "false").lower() == "true"
-    if skip:
+    skip_sec = cfg("AI_COMMIT_SKIP_SECURITY", "false").lower() == "true"
+    if skip_sec:
         warn("AI_COMMIT_SKIP_SECURITY=true — skipping security scan")
     else:
+        # CORREGIDO: Eliminadas las anotaciones
+        staged_diff = get_staged_diff() 
         files = get_staged_files()
-        info(f"Scanning {len(files)} file(s) for exposed secrets…")
+        info(f"Scanning staged changes for exposed secrets…")
+        
         issues = scan_secrets(files)
 
-        # also run gitleaks / trufflehog if available
+        # FIXED: Use re.search directly without any() for a single string
+        security_pattern = r'(?i)api_key|password|secret|token|sk-live|ghp_'
+        if re.search(security_pattern, staged_diff):
+            issues.append("Sensitive patterns detected in the staged diff.")
+
+        # External Tool: Gitleaks (Safe Execution)
         if cmd_exists("gitleaks"):
-            info("Running gitleaks (installed) …")
-            if not run_ok(["gitleaks", "protect", "--staged", "-v"]):
-                issues.append("gitleaks found potential secrets — review before committing")
-        elif cmd_exists("trufflehog"):
-            info("Running trufflehog …")
-            if not run_ok(["trufflehog", "git", "file://.", "--only-verified", "--no-update"],
-                          shell=False):
-                issues.append("trufflehog found verified secrets")
+            info("Running gitleaks…")
+            # shell=False is used for security
+            if not run_ok(["gitleaks", "protect", "--staged", "-v"], shell=False):
+                issues.append("Gitleaks detected potential secrets.")
 
         if issues:
-            for i in issues:
-                err(i)
+            for i in issues: err(i)
             if cfg("AI_COMMIT_STRICT_SECURITY", "true").lower() == "true":
-                die("Security check FAILED — commit aborted. Set "
-                    "AI_COMMIT_STRICT_SECURITY=false to downgrade to warning.", 4)
-            else:
-                warn("Security issues found but AI_COMMIT_STRICT_SECURITY=false — continuing")
+                die("Security check FAILED. Commit aborted to prevent leaks.", 4)
         else:
             ok("No secrets detected ✓")
 
-    # build
-    build_cmd = cfg("AI_COMMIT_BUILD_CMD")
-    skip_build = cfg("AI_COMMIT_SKIP_BUILD", "false").lower() == "true"
-
-    if skip_build:
+    # --- Build Section ---
+    if cfg("AI_COMMIT_SKIP_BUILD", "false").lower() == "true":
         warn("AI_COMMIT_SKIP_BUILD=true — skipping build")
         return
 
-    cwd = Path.cwd()
-    if not build_cmd:
-        if (cwd / "package.json").exists():
-            pkg = json.loads((cwd / "package.json").read_text())
-            if "build" in pkg.get("scripts", {}):
-                build_cmd = "npm run build"
-        elif (cwd / "Makefile").exists():
-            build_cmd = "make build"
-        elif (cwd / "pyproject.toml").exists() and cmd_exists("python"):
-            build_cmd = "python -m build --wheel --no-isolation"
-
+    build_cmd = cfg("AI_COMMIT_BUILD_CMD")
     if build_cmd:
         info(f"Running build: {build_cmd}")
         try:
-            run(build_cmd, shell=True)
+            # SAFE: split command string into arguments list
+            import shlex
+            build_args = shlex.split(build_cmd)
+            run(build_args, shell=False, capture=True)
             ok("Build succeeded ✓")
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            print(f"{C.RED}{e.stderr}{C.RESET}")
             die("Build FAILED — fix errors before pushing.", 5)
-    else:
-        warn("No build command detected. Set AI_COMMIT_BUILD_CMD in .env to add one.")
 
+def get_clean_diff() -> str:
+    # Filter out lockfiles and binary-like assets from the diff
+    cmd = [
+        "git", "diff", "--cached", 
+        "--", ":!*-lock.json", ":!*.lock", ":!*.svg", ":!*.png"
+    ]
+    result = run(cmd, capture=True)
+    return result.stdout.strip()            
 # ─────────────────────────────────────────────
 # 6. PHASE 4 — GIT COMMIT & PUSH
 # ─────────────────────────────────────────────
