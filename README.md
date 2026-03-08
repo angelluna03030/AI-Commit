@@ -78,8 +78,8 @@ Before you begin, make sure you have the following installed on your machine:
 ### 1 — Clone the repository
 
 ```bash
-git clone https://github.com/angelluna03030/ai-commit-deploy.git
-cd ai-commit-deploy
+git clone https://github.com/angelluna03030/AI-Commit
+cd ai-commit
 ```
 
 ### 2 — Run the installer
@@ -388,7 +388,7 @@ Please make sure your code follows the existing style and that all tests pass be
 
 ### Reporting bugs
 
-Found a bug? Please [open an issue](https://github.com/angelluna03030/ai-commit-deploy/issues) with:
+Found a bug? Please [open an issue](https://github.com/angelluna03030/ai-commit/issues) with:
 - Your OS and shell (e.g. Windows 11, Git Bash)
 - The exact command you ran
 - The full error output
