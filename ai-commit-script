@@ -2,7 +2,7 @@
 """
 ╔═══════════════════════════════════════════════════════════╗
 ║              AI-COMMIT — Smart Git Workflow               ║
-║   Quality Checks → AI Commit → Security → Push           ║
+║   Quality Checks → AI Commit → Security → Push            ║
 ╚═══════════════════════════════════════════════════════════╝
 
 Cross-platform (Linux / macOS / Windows via Git Bash / WSL)
